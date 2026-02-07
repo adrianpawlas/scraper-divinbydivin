@@ -1,17 +1,24 @@
 """
 SigLIP (google/siglip-base-patch16-384) image and text embeddings, 768-dim.
+Uses explicit SiglipImageProcessor and SiglipTokenizer to avoid AutoProcessor
+tokenizer-mapping bugs in some transformers versions (e.g. on GitHub Actions).
 """
 import io
 import requests
 from typing import List
 from PIL import Image
 import torch
-from transformers import AutoProcessor, AutoModel
+from transformers import (
+    AutoModel,
+    SiglipImageProcessor,
+    SiglipTokenizer,
+)
 from config import SIGLIP_MODEL_ID, EMBEDDING_DIM
 
 
 _model = None
-_processor = None
+_image_processor = None
+_tokenizer = None
 _device = None
 
 
@@ -23,13 +30,14 @@ def _get_device():
 
 
 def _load_model():
-    global _model, _processor
+    global _model, _image_processor, _tokenizer
     if _model is None:
-        _processor = AutoProcessor.from_pretrained(SIGLIP_MODEL_ID)
+        _image_processor = SiglipImageProcessor.from_pretrained(SIGLIP_MODEL_ID)
+        _tokenizer = SiglipTokenizer.from_pretrained(SIGLIP_MODEL_ID)
         _model = AutoModel.from_pretrained(SIGLIP_MODEL_ID)
         _model.to(_get_device())
         _model.eval()
-    return _model, _processor
+    return _model, _image_processor, _tokenizer
 
 
 def image_from_url(url: str) -> Image.Image:
@@ -40,20 +48,18 @@ def image_from_url(url: str) -> Image.Image:
 
 def get_image_embedding(image: Image.Image | str) -> List[float]:
     """Return 768-dim embedding for one image (PIL or URL)."""
-    model, processor = _load_model()
+    model, image_processor, tokenizer = _load_model()
     device = _get_device()
     if isinstance(image, str):
         image = image_from_url(image)
-    inputs = processor(images=image, text=[""], padding="max_length", return_tensors="pt")
-    inputs = {k: v.to(device) for k, v in inputs.items()}
+    pixel_values = image_processor(images=image, return_tensors="pt").pixel_values.to(device)
     with torch.no_grad():
         if hasattr(model, "get_image_features"):
-            image_embeds = model.get_image_features(pixel_values=inputs["pixel_values"])
+            image_embeds = model.get_image_features(pixel_values=pixel_values)
         else:
-            # Fallback: pass dummy text and take image_embeds from full forward
-            inputs["input_ids"] = processor.tokenizer([""], padding="max_length", return_tensors="pt")["input_ids"].to(device)
-            inputs["attention_mask"] = (inputs["input_ids"] != processor.tokenizer.pad_token_id).long().to(device)
-            out = model(**inputs)
+            input_ids = tokenizer([""], padding="max_length", return_tensors="pt").input_ids.to(device)
+            attention_mask = (input_ids != tokenizer.pad_token_id).long().to(device)
+            out = model(pixel_values=pixel_values, input_ids=input_ids, attention_mask=attention_mask)
             image_embeds = out.image_embeds
     vec = image_embeds[0].float().cpu().numpy()
     assert len(vec) == EMBEDDING_DIM, f"expected {EMBEDDING_DIM}, got {len(vec)}"
@@ -64,18 +70,24 @@ def get_text_embedding(text: str) -> List[float]:
     """Return 768-dim embedding for text (same model text encoder)."""
     if not (text or text.strip()):
         text = " "
-    model, processor = _load_model()
+    model, _image_processor, tokenizer = _load_model()
     device = _get_device()
-    inputs = processor(text=[text], padding="max_length", return_tensors="pt", truncation=True)
-    inputs = {k: v.to(device) for k, v in inputs.items()}
+    encoded = tokenizer(
+        [text],
+        padding="max_length",
+        return_tensors="pt",
+        truncation=True,
+    )
+    input_ids = encoded.input_ids.to(device)
+    attention_mask = encoded.attention_mask.to(device)
     with torch.no_grad():
         if hasattr(model, "get_text_features"):
             text_embeds = model.get_text_features(
-                input_ids=inputs["input_ids"],
-                attention_mask=inputs.get("attention_mask"),
+                input_ids=input_ids,
+                attention_mask=attention_mask,
             )
         else:
-            out = model(**{k: v for k, v in inputs.items() if k in ("input_ids", "attention_mask", "position_ids")})
+            out = model(input_ids=input_ids, attention_mask=attention_mask)
             text_embeds = out.text_embeds
     vec = text_embeds[0].float().cpu().numpy()
     assert len(vec) == EMBEDDING_DIM, f"expected {EMBEDDING_DIM}, got {len(vec)}"
