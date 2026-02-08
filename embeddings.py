@@ -54,14 +54,13 @@ def get_image_embedding(image: Image.Image | str) -> List[float]:
         image = image_from_url(image)
     pixel_values = image_processor(images=image, return_tensors="pt").pixel_values.to(device)
     with torch.no_grad():
-        if hasattr(model, "get_image_features"):
-            image_embeds = model.get_image_features(pixel_values=pixel_values)
-        else:
-            input_ids = tokenizer([""], padding="max_length", return_tensors="pt").input_ids.to(device)
-            attention_mask = (input_ids != tokenizer.pad_token_id).long().to(device)
-            out = model(pixel_values=pixel_values, input_ids=input_ids, attention_mask=attention_mask)
-            image_embeds = out.image_embeds
+        # Use vision_model directly so we always get pooler_output (batch, 768).
+        # get_image_features() can return ModelOutput where [0] is last_hidden_state.
+        vision_out = model.vision_model(pixel_values)
+        image_embeds = vision_out.pooler_output  # (batch, 768)
     vec = image_embeds[0].float().cpu().numpy()
+    if vec.ndim > 1:
+        vec = vec.flatten()
     assert len(vec) == EMBEDDING_DIM, f"expected {EMBEDDING_DIM}, got {len(vec)}"
     return vec.tolist()
 
@@ -77,18 +76,23 @@ def get_text_embedding(text: str) -> List[float]:
         padding="max_length",
         return_tensors="pt",
         truncation=True,
+        return_attention_mask=True,
     )
     input_ids = encoded.input_ids.to(device)
-    attention_mask = encoded.attention_mask.to(device)
+    attention_mask = (
+        encoded.attention_mask.to(device)
+        if "attention_mask" in encoded
+        else (input_ids != tokenizer.pad_token_id).long().to(device)
+    )
     with torch.no_grad():
-        if hasattr(model, "get_text_features"):
-            text_embeds = model.get_text_features(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-            )
-        else:
-            out = model(input_ids=input_ids, attention_mask=attention_mask)
-            text_embeds = out.text_embeds
+        text_embeds = model.get_text_features(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+        )
+        if hasattr(text_embeds, "pooler_output") and text_embeds.pooler_output is not None:
+            text_embeds = text_embeds.pooler_output
     vec = text_embeds[0].float().cpu().numpy()
+    if vec.ndim > 1:
+        vec = vec.flatten()
     assert len(vec) == EMBEDDING_DIM, f"expected {EMBEDDING_DIM}, got {len(vec)}"
     return vec.tolist()
