@@ -4,7 +4,7 @@ name: Run Divin Scraper
 on:
   schedule:
     # Every day at 00:00 UTC
-    - cron: '0 0 * * *'
+    - cron: '0 8 * * *'
   workflow_dispatch:
     # "Run workflow" button in Actions tab
 
